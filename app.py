@@ -1,25 +1,23 @@
-import os
 import io
-import json
+import os
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-
-# ========= 基础路径 =========
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
-PASSWORD_FILE = os.path.join(DATA_DIR, "passwords.json")
-INDEX_FILE = os.path.join(DATA_DIR, "archive_index.json")
-DOWNLOAD_LOG_FILE = os.path.join(DATA_DIR, "download_logs.json")
-
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(ARCHIVE_DIR, exist_ok=True)
+from supabase import create_client
 
 st.set_page_config(page_title="供应商数据下载", layout="wide")
+
+# ========= Supabase 连接 =========
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ========= 配置 =========
+BUCKET_NAME = "archive-files"
+RETENTION_DAYS = 30
 
 # ========= 时区：统一北京时间 =========
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
@@ -82,168 +80,273 @@ def get_admin_password() -> str:
         return "admin123"
 
 
+def format_db_time_to_bj_str(value):
+    """
+    把数据库返回的时间统一转成北京时间字符串
+    """
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    try:
+        text = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BEIJING_TZ)
+        dt_bj = dt.astimezone(BEIJING_TZ)
+        return dt_bj.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text
+
+
+def build_storage_path(source_name: str, source_date: str) -> str:
+    """
+    生成只包含英文/数字的 Storage 路径，避免中文文件名导致 InvalidKey
+    """
+    ext = os.path.splitext(source_name)[1].lower()
+    if ext not in [".xlsx", ".xlsm"]:
+        ext = ".xlsx"
+
+    timestamp = now_bj().strftime("%Y%m%d_%H%M%S")
+    return f"archive/{source_date}_file_{timestamp}{ext}"
+
+
+# ========= 供应商密码：Supabase =========
 def load_passwords() -> dict:
-    if os.path.exists(PASSWORD_FILE):
-        with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    result = supabase.table("supplier_passwords").select("supplier_name,password").execute()
+
+    data = {}
+    for row in (result.data or []):
+        supplier_name = str(row.get("supplier_name", "")).strip()
+        password = str(row.get("password", ""))
+        if supplier_name:
+            data[supplier_name] = password
+
+    return data
 
 
 def save_passwords(data: dict):
-    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    for supplier_name, password in data.items():
+        supplier_name = str(supplier_name).strip()
+        password = str(password).strip()
+
+        if supplier_name:
+            supabase.table("supplier_passwords").upsert({
+                "supplier_name": supplier_name,
+                "password": password,
+                "updated_at": now_bj().isoformat()
+            }).execute()
 
 
-def load_index() -> list:
-    if os.path.exists(INDEX_FILE):
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-    return []
-
-
-def save_index(data: list):
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
+# ========= 下载日志：Supabase =========
 def load_download_logs() -> list:
-    if os.path.exists(DOWNLOAD_LOG_FILE):
-        with open(DOWNLOAD_LOG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-    return []
+    result = (
+        supabase
+        .table("download_logs")
+        .select("*")
+        .order("download_time", desc=True)
+        .execute()
+    )
 
+    logs = result.data or []
 
-def save_download_logs(data: list):
-    with open(DOWNLOAD_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    for row in logs:
+        row["download_time"] = format_db_time_to_bj_str(row.get("download_time"))
+
+    return logs
 
 
 def log_download_event(supplier_name: str, source_date: str, source_name: str, download_name: str, row_count: int):
-    logs = load_download_logs()
-    logs.insert(0, {
-        "download_time": now_bj_str(),
+    supabase.table("download_logs").insert({
+        "download_time": now_bj().isoformat(),
         "supplier_name": supplier_name,
         "source_date": source_date,
         "source_name": source_name,
         "download_name": download_name,
         "row_count": int(row_count),
-    })
-    save_download_logs(logs)
+    }).execute()
 
 
-def cleanup_old_files(retention_days: int = 30):
+# ========= 归档文件：Supabase Storage + archive_files 表 =========
+def cleanup_old_files(retention_days: int = RETENTION_DAYS):
     """
-    清理超出保留天数的历史文件。
+    清理超过保留天数的文件：
+    - 删除 Storage 里的文件
+    - 把 archive_files 表中的记录标记为 is_deleted = true
     """
-    records = load_index()
+    result = (
+        supabase
+        .table("archive_files")
+        .select("*")
+        .eq("is_deleted", False)
+        .execute()
+    )
+
+    records = result.data or []
     today = today_bj()
-    kept = []
 
     for rec in records:
-        source_date = rec.get("source_date", "")
-        file_path = rec.get("file_path", "")
+        source_date = str(rec.get("source_date", "")).strip()
+        storage_path = str(rec.get("storage_path", "")).strip()
 
-        keep_this = True
         try:
             file_date = datetime.strptime(source_date, "%Y%m%d").date()
             if (today - file_date).days > retention_days:
-                keep_this = False
+                if storage_path:
+                    try:
+                        supabase.storage.from_(BUCKET_NAME).remove([storage_path])
+                    except Exception:
+                        pass
+
+                supabase.table("archive_files").update({
+                    "is_deleted": True
+                }).eq("source_date", source_date).execute()
         except Exception:
-            pass
-
-        if keep_this and os.path.exists(file_path):
-            kept.append(rec)
-        else:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-
-    save_index(kept)
+            continue
 
 
 def save_uploaded_file(uploaded_file):
     """
-    按文件名日期保存。
-    同一天重复上传时，覆盖当天旧文件。
+    上传文件到 Supabase Storage，并在 archive_files 表中写入索引
+    同一天重复上传时，覆盖当天旧记录
     """
-    cleanup_old_files(retention_days=30)
+    cleanup_old_files()
 
     source_name = uploaded_file.name
     source_date = extract_date_from_filename(source_name)
-    saved_name = f"{source_date}_{safe_filename(source_name)}"
-    file_path = os.path.join(ARCHIVE_DIR, saved_name)
+    storage_path = build_storage_path(source_name, source_date)
 
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    # 根据扩展名给 content-type
+    ext = os.path.splitext(source_name)[1].lower()
+    if ext == ".xlsm":
+        content_type = "application/vnd.ms-excel.sheet.macroEnabled.12"
+    else:
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-    records = load_index()
-    new_records = []
+    # 先看看同一天是否已有旧记录
+    existing = (
+        supabase
+        .table("archive_files")
+        .select("*")
+        .eq("source_date", source_date)
+        .limit(1)
+        .execute()
+    )
 
-    for rec in records:
-        if rec.get("source_date") == source_date:
-            old_path = rec.get("file_path", "")
-            if os.path.exists(old_path):
-                try:
-                    os.remove(old_path)
-                except Exception:
-                    pass
-        else:
-            if os.path.exists(rec.get("file_path", "")):
-                new_records.append(rec)
+    existing_rows = existing.data or []
+    if existing_rows:
+        old_storage_path = str(existing_rows[0].get("storage_path", "")).strip()
+        if old_storage_path:
+            try:
+                supabase.storage.from_(BUCKET_NAME).remove([old_storage_path])
+            except Exception:
+                pass
 
-    new_records.append({
-        "source_name": source_name,
+    # 关键：上传 bytes，不直接传 UploadedFile
+    file_bytes = uploaded_file.getvalue()
+
+    supabase.storage.from_(BUCKET_NAME).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={
+            "upsert": "true",
+            "content-type": content_type
+        }
+    )
+
+    # 写入索引表
+    supabase.table("archive_files").upsert({
         "source_date": source_date,
-        "upload_time": now_bj_str(),
-        "file_path": file_path
-    })
-
-    new_records.sort(key=lambda x: x.get("source_date", ""), reverse=True)
-    save_index(new_records)
+        "source_name": source_name,
+        "upload_time": now_bj().isoformat(),
+        "storage_path": storage_path,
+        "is_deleted": False
+    }).execute()
 
 
 def delete_record_by_date(source_date: str):
     """
-    删除指定日期的归档文件及其索引记录
+    删除指定日期的归档文件：
+    - 删除 Storage 文件
+    - 将 archive_files 标记为 is_deleted = true
     """
-    records = load_index()
-    new_records = []
+    record = (
+        supabase
+        .table("archive_files")
+        .select("*")
+        .eq("source_date", source_date)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
 
-    for rec in records:
-        if rec.get("source_date") == source_date:
-            file_path = rec.get("file_path", "")
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-        else:
-            if os.path.exists(rec.get("file_path", "")):
-                new_records.append(rec)
+    rows = record.data or []
+    if not rows:
+        return
 
-    save_index(new_records)
+    storage_path = str(rows[0].get("storage_path", "")).strip()
+
+    if storage_path:
+        try:
+            supabase.storage.from_(BUCKET_NAME).remove([storage_path])
+        except Exception:
+            pass
+
+    supabase.table("archive_files").update({
+        "is_deleted": True
+    }).eq("source_date", source_date).execute()
 
 
 def get_archive_records() -> list:
-    cleanup_old_files(retention_days=30)
-    records = load_index()
-    valid_records = [x for x in records if os.path.exists(x.get("file_path", ""))]
-    valid_records.sort(key=lambda x: x.get("source_date", ""), reverse=True)
-    return valid_records
+    cleanup_old_files()
+
+    result = (
+        supabase
+        .table("archive_files")
+        .select("*")
+        .eq("is_deleted", False)
+        .order("source_date", desc=True)
+        .execute()
+    )
+
+    records = result.data or []
+    return records
 
 
 def get_record_by_date(source_date: str):
-    records = get_archive_records()
-    for rec in records:
-        if rec.get("source_date") == source_date:
-            return rec
-    return None
+    result = (
+        supabase
+        .table("archive_files")
+        .select("*")
+        .eq("source_date", source_date)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
+
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def load_df_from_record(record):
+    """
+    从 Supabase Storage 下载 Excel，并读取成 DataFrame
+    """
+    if not record:
+        return None, None
+
+    storage_path = str(record.get("storage_path", "")).strip()
+    if not storage_path:
+        return None, None
+
+    file_bytes = supabase.storage.from_(BUCKET_NAME).download(storage_path)
+    df = pd.read_excel(io.BytesIO(file_bytes), dtype=str)
+    df = df.fillna("")
+    transport_col = find_transport_column(df)
+    return df, transport_col
 
 
 def find_transport_column(df: pd.DataFrame):
@@ -259,20 +362,6 @@ def find_transport_column(df: pd.DataFrame):
         return df.columns[39]
 
     raise ValueError("找不到“运输”列，也没有 AN 列可用。")
-
-
-def load_df_from_record(record):
-    if not record:
-        return None, None
-
-    file_path = record.get("file_path", "")
-    if not os.path.exists(file_path):
-        return None, None
-
-    df = pd.read_excel(file_path, dtype=str)
-    df = df.fillna("")
-    transport_col = find_transport_column(df)
-    return df, transport_col
 
 
 def get_supplier_list(df: pd.DataFrame, transport_col):
@@ -369,6 +458,8 @@ with st.sidebar:
     st.write("5. 供应商输入自己的供应商名称和密码")
     st.write("6. 再按日期查看和下载自己的数据")
     st.write("7. 管理员可查看供应商下载日志")
+    st.info("所有显示时间已统一为北京时间")
+    st.info("当前版本：密码、日志、文件归档、归档索引都已迁到 Supabase")
 
 
 # ========= 标签页 =========
@@ -444,10 +535,10 @@ with tab_admin:
         records = get_archive_records()
         if records:
             for rec in records:
-                date_raw = rec.get("source_date", "")
+                date_raw = str(rec.get("source_date", ""))
                 date_text = normalize_date_display(date_raw)
-                source_name = rec.get("source_name", "")
-                upload_time = rec.get("upload_time", "")
+                source_name = str(rec.get("source_name", ""))
+                upload_time = format_db_time_to_bj_str(rec.get("upload_time"))
 
                 row_col1, row_col2 = st.columns([11, 2], gap="small")
                 with row_col1:
